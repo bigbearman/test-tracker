@@ -1,0 +1,11 @@
+{
+  "name": "test-tracker",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@vercel/functions": "^3.4.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}
