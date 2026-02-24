@@ -24,22 +24,110 @@ const KNOWN_AGENTS: Record<string, RegExp> = {
   DuckAssistant: /DuckAssistant|DuckAssistBot/i,
 };
 
+const CONFIDENCE = {
+  SERVER_UA: 95,
+  PATTERN: 40,
+  EXTRA_LAYER_BONUS: 5,
+  AGENT_THRESHOLD: 50,
+};
+
 const SITE_ID = 'aa_569ea2ed4656331dd764d7d0f9a33d7d2444d29924aaec40';
 const COLLECT_ENDPOINT = 'https://api-production-feb6.up.railway.app/collect';
 
-/** Layer 1: Server UA match — confidence 95 */
-function detectAgent(ua: string): { isAgent: boolean; agentName: string; confidence: number } {
+interface DetectionResult {
+  isAgent: boolean;
+  agentName: string;
+  confidence: number;
+  layers: string[];
+}
+
+/**
+ * Multi-layer agent detection:
+ * Layer 1: UA string match (confidence 95)
+ * Layer 3: Request pattern analysis (confidence 40)
+ * Combined: max + 5 per extra layer
+ */
+function detectAgent(request: Request): DetectionResult {
+  const ua = request.headers.get('user-agent') ?? '';
+  const layers: { name: string; score: number }[] = [];
+  let agentName = '';
+
+  // Layer 1: User Agent match
   for (const [name, pattern] of Object.entries(KNOWN_AGENTS)) {
     if (pattern.test(ua)) {
-      return { isAgent: true, agentName: name, confidence: 95 };
+      layers.push({ name: 'ua', score: CONFIDENCE.SERVER_UA });
+      agentName = name;
+      break;
     }
   }
-  return { isAgent: false, agentName: '', confidence: 0 };
+
+  // Layer 3: Request pattern analysis
+  const patternScore = analyzePatterns(request);
+  if (patternScore >= CONFIDENCE.PATTERN) {
+    layers.push({ name: 'pattern', score: patternScore });
+  }
+
+  if (layers.length === 0) {
+    return { isAgent: false, agentName: '', confidence: 0, layers: [] };
+  }
+
+  const maxScore = Math.max(...layers.map((l) => l.score));
+  const extraLayers = layers.length - 1;
+  const finalConfidence = Math.min(100, maxScore + extraLayers * CONFIDENCE.EXTRA_LAYER_BONUS);
+
+  return {
+    isAgent: finalConfidence >= CONFIDENCE.AGENT_THRESHOLD,
+    agentName: agentName || 'unknown-pattern',
+    confidence: finalConfidence,
+    layers: layers.map((l) => l.name),
+  };
+}
+
+/**
+ * Layer 3: Analyze request headers for bot-like patterns.
+ * Bots typically: no referer, no cookies, no accept-language,
+ * unusual accept header, missing sec-fetch-* headers.
+ */
+function analyzePatterns(request: Request): number {
+  let score = 0;
+
+  // No Referer — bots don't navigate from other pages
+  if (!request.headers.get('referer')) {
+    score += 10;
+  }
+
+  // No Cookie — bots don't carry session cookies
+  if (!request.headers.get('cookie')) {
+    score += 10;
+  }
+
+  // No Accept-Language — real browsers always send this
+  if (!request.headers.get('accept-language')) {
+    score += 15;
+  }
+
+  // Accept header missing text/html or is wildcard
+  const accept = request.headers.get('accept') ?? '';
+  if (!accept || accept === '*/*') {
+    score += 10;
+  } else if (!accept.includes('text/html')) {
+    score += 10;
+  }
+
+  // Missing Sec-Fetch-* headers — modern browsers always send these
+  if (!request.headers.get('sec-fetch-mode')) {
+    score += 10;
+  }
+  if (!request.headers.get('sec-fetch-site')) {
+    score += 5;
+  }
+
+  return score;
 }
 
 function sendEvent(
   request: Request,
-  agent: { isAgent: boolean; agentName: string; confidence: number },
+  detection: DetectionResult,
 ): Promise<Response> {
   const url = new URL(request.url);
   const ip = ipAddress(request) ?? '';
@@ -49,7 +137,11 @@ function sendEvent(
     siteId: SITE_ID,
     url: url.toString(),
     action: 'pageview' as const,
-    agent,
+    agent: {
+      isAgent: detection.isAgent,
+      agentName: detection.agentName,
+      confidence: detection.confidence,
+    },
     timestamp: Date.now(),
     source: 'server' as const,
     meta: {
@@ -57,6 +149,7 @@ function sendEvent(
       country: geo?.country ?? '',
       city: geo?.city ?? '',
       userAgent: request.headers.get('user-agent') ?? '',
+      layers: detection.layers,
     },
   };
 
@@ -68,13 +161,15 @@ function sendEvent(
 }
 
 export default function middleware(request: Request, context: RequestContext) {
-  const ua = request.headers.get('user-agent') ?? '';
-  const agent = detectAgent(ua);
+  const detection = detectAgent(request);
 
-  console.log(`[middleware] ${agent.isAgent ? agent.agentName : 'human'} → ${new URL(request.url).pathname}`);
+  const label = detection.isAgent
+    ? `${detection.agentName} (${detection.confidence}%, ${detection.layers.join('+')})`
+    : 'human';
+  console.log(`[middleware] ${label} → ${new URL(request.url).pathname}`);
 
   // Fire-and-forget: send event without blocking the response
-  context.waitUntil(sendEvent(request, agent));
+  context.waitUntil(sendEvent(request, detection));
 
   // Pass through to static files
   return next();
